@@ -1,12 +1,14 @@
 //! Headless batch scan: cost every STL/OBJ in a folder and publish to the catalog.
 //!
 //! Invoked as a subcommand so the GUI binary doubles as a CLI:
-//!   jewelry_cost_calculator scan <DIR> [--kind ring|pendant|auto] [--sizes 5-10]
-//!   [--recursive] [--dry-run] [--offline] [--wax-cost 0.10] [--report out.json]
+//!   jewelry_cost_calculator scan <DIR> [--kind ring|pendant|auto] [--recursive]
+//!   [--dry-run] [--offline] [--wax-cost 0.10] [--report out.json]
 //!
-//! Ring size is read from the filename (authoritative); its known inner diameter
-//! anchors the size-range scaling. Ring files with no parseable size are skipped
-//! and listed in the report for manual review.
+//! Ring files are named with the size appended to the design (e.g. `Hades9.stl`,
+//! `Kamon-11.25.stl`, `AthenaRing8.obj`). The size becomes the row's ring_size and
+//! the remaining name becomes the catalog design_key, so every size groups under
+//! one design. Each file is costed at its native volume. Files with no parseable
+//! ring size are skipped and listed in the report for manual review.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -19,8 +21,11 @@ use serde::Serialize;
 use crate::materials::calculate_all_weights;
 use crate::mesh::{load_mesh, volume::calculate_volume_cm3};
 use crate::pricing::{api::fetch_metal_prices, calculate_all_costs, MetalPrices, WaxPricing};
-use crate::report::CostReport;
-use crate::ring_sizing::RingSize;
+use crate::report::{CostReport, JewelryType};
+
+/// Plausible US ring sizes; bounds reject part numbers and version tags.
+const RING_SIZE_MIN: f64 = 3.0;
+const RING_SIZE_MAX: f64 = 16.0;
 
 #[derive(Parser)]
 #[command(name = "jewelry_cost_calculator", disable_help_subcommand = true)]
@@ -42,9 +47,6 @@ struct ScanArgs {
     /// Treat files as: ring | pendant | auto
     #[arg(long, default_value = "auto")]
     kind: String,
-    /// Ring size range to publish, e.g. "5-10"
-    #[arg(long, default_value = "5-10")]
-    sizes: String,
     /// Recurse into subdirectories
     #[arg(long)]
     recursive: bool,
@@ -86,9 +88,9 @@ async fn run(args: ScanArgs) -> i32 {
 #[derive(Serialize)]
 struct ScanItem {
     file: String,
+    design_key: Option<String>,
     kind: String,
     ring_size: Option<String>,
-    sizes_published: Vec<String>,
     volume_cm3: f64,
     silver_usd: Option<f64>,
     rows: usize,
@@ -108,8 +110,6 @@ struct ScanReport {
 }
 
 async fn run_inner(args: ScanArgs) -> Result<i32> {
-    let (lo, hi) = parse_size_range(&args.sizes)?;
-
     let prices = if args.offline {
         eprintln!("offline: using default metal prices");
         MetalPrices::default()
@@ -148,11 +148,12 @@ async fn run_inner(args: ScanArgs) -> Result<i32> {
 
     let mut items: Vec<ScanItem> = Vec::with_capacity(files.len());
     for path in &files {
-        let item = process_file(path, &kind, lo, hi, &prices, &wax, args.dry_run).await;
+        let item = process_file(path, &kind, &prices, &wax, args.dry_run).await;
         println!(
-            "{:<40} {:<8} {:>10} {}",
-            truncate(&item.file, 40),
+            "{:<42} {:<7} {:<7} {:>10}  {}",
+            truncate(&item.file, 42),
             item.kind,
+            item.ring_size.as_deref().unwrap_or("-"),
             format!("{:.3}cm3", item.volume_cm3),
             item.status
         );
@@ -183,20 +184,16 @@ async fn run_inner(args: ScanArgs) -> Result<i32> {
         items,
     };
     if let Some(path) = &args.report {
-        let json = serde_json::to_string_pretty(&report)?;
-        std::fs::write(path, json)?;
+        std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
         eprintln!("wrote scan report to {}", path.display());
     }
 
     Ok(if report.errors > 0 { 1 } else { 0 })
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn process_file(
     path: &Path,
     kind: &str,
-    lo: f64,
-    hi: f64,
     prices: &MetalPrices,
     wax: &WaxPricing,
     dry_run: bool,
@@ -210,9 +207,9 @@ async fn process_file(
 
     let mut item = ScanItem {
         file: file.clone(),
+        design_key: None,
         kind: "?".into(),
         ring_size: None,
-        sizes_published: Vec::new(),
         volume_cm3: 0.0,
         silver_usd: None,
         rows: 0,
@@ -229,37 +226,42 @@ async fn process_file(
     let volume_cm3 = calculate_volume_cm3(&mesh);
     item.volume_cm3 = volume_cm3;
     if !(volume_cm3 > 0.0) {
-        item.status = "skipped: zero/invalid volume".into();
         item.kind = "skipped".into();
+        item.status = "skipped: zero/invalid volume".into();
         return item;
     }
 
-    let size_from_name = parse_ring_size_from_filename(stem);
+    let ring = parse_ring(stem);
     let as_ring = match kind {
         "ring" => true,
         "pendant" => false,
-        _ => size_from_name.is_some(),
+        _ => ring.is_some(),
     };
 
+    let weights = calculate_all_weights(volume_cm3, None);
+    let costs = calculate_all_costs(&weights, prices, wax);
+
     let report = if as_ring {
-        let Some(size) = size_from_name else {
-            item.status = "skipped: no ring size in filename".into();
+        let Some((design_key, size)) = ring else {
             item.kind = "skipped".into();
+            item.status = "skipped: no ring size in filename".into();
             return item;
         };
+        let size_label = format!("US {}", fmt_size(size));
         item.kind = "ring".into();
-        item.ring_size = Some(RingSize::new(size).display());
-        let anchor = RingSize::new(size);
-        let range = RingSize::range(lo, hi);
-        CostReport::new_ring(file.clone(), volume_cm3, anchor.inner_diameter_mm(), &range, prices, wax)
+        item.design_key = Some(design_key.clone());
+        item.ring_size = Some(size_label.clone());
+        let mut r = CostReport::new_pendant(design_key, volume_cm3, &costs, prices);
+        r.jewelry_type = JewelryType::Ring;
+        r.sizes[0].ring_size = size_label;
+        r
     } else {
+        let design_key = stem.trim().to_string();
         item.kind = "pendant".into();
-        let weights = calculate_all_weights(volume_cm3, None);
-        let costs = calculate_all_costs(&weights, prices, wax);
+        item.design_key = Some(design_key);
         CostReport::new_pendant(file.clone(), volume_cm3, &costs, prices)
     };
 
-    item.sizes_published = report.sizes.iter().map(|s| s.ring_size.clone()).collect();
     item.silver_usd = report
         .sizes
         .first()
@@ -277,53 +279,49 @@ async fn process_file(
             item.rows = count;
             item.status = "published".into();
         }
-        Err(e) => {
-            item.status = format!("error: publish failed ({e})");
-        }
+        Err(e) => item.status = format!("error: publish failed ({e})"),
     }
     item
 }
 
-/// Parse "lo-hi" into an inclusive ring-size range (e.g. "5-10").
-fn parse_size_range(s: &str) -> Result<(f64, f64)> {
-    let (a, b) = s
-        .split_once('-')
-        .ok_or_else(|| anyhow!("--sizes must look like 5-10 (got '{}')", s))?;
-    let lo: f64 = a.trim().parse().map_err(|_| anyhow!("bad low size in '{}'", s))?;
-    let hi: f64 = b.trim().parse().map_err(|_| anyhow!("bad high size in '{}'", s))?;
-    if lo > hi {
-        return Err(anyhow!("--sizes low {} is greater than high {}", lo, hi));
-    }
-    Ok((lo, hi))
-}
+/// Split a ring filename stem into (design_key, size). The size is the last
+/// number in the plausible ring range; the design_key is the text before it.
+fn parse_ring(stem: &str) -> Option<(String, f64)> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"\d{1,2}(?:\.\d{1,2})?").unwrap());
 
-/// Extract a US ring size from a filename stem, preferring labeled tokens.
-fn parse_ring_size_from_filename(stem: &str) -> Option<f64> {
-    static LABELED: OnceLock<Regex> = OnceLock::new();
-    static BARE: OnceLock<Regex> = OnceLock::new();
-    let labeled = LABELED
-        .get_or_init(|| Regex::new(r"(?i)(?:size|sz|us)[\s_\-\.]*([0-9]{1,2}(?:\.5|\.0)?)").unwrap());
-    if let Some(c) = labeled.captures(stem) {
-        if let Ok(v) = c[1].parse::<f64>() {
-            if (2.0..=16.0).contains(&v) {
-                return Some(round_half(v));
+    let mut hit: Option<(usize, f64)> = None;
+    for m in re.find_iter(stem) {
+        if let Ok(v) = m.as_str().parse::<f64>() {
+            if (RING_SIZE_MIN..=RING_SIZE_MAX).contains(&v) {
+                hit = Some((m.start(), v)); // keep the last in-range match
             }
         }
     }
-    let bare = BARE
-        .get_or_init(|| Regex::new(r"(?:^|[\s_\-\(\[])([0-9]{1,2}(?:\.5)?)(?:[\s_\-\)\]]|$)").unwrap());
-    for c in bare.captures_iter(stem) {
-        if let Ok(v) = c[1].parse::<f64>() {
-            if (3.0..=15.0).contains(&v) {
-                return Some(round_half(v));
-            }
-        }
+    let (start, size) = hit?;
+    let design = stem[..start]
+        .trim_end_matches(|c: char| c == ' ' || c == '-' || c == '_' || c == '.')
+        .trim();
+    if design.is_empty() {
+        return None;
     }
-    None
+    Some((design.to_string(), size))
 }
 
-fn round_half(v: f64) -> f64 {
-    (v * 2.0).round() / 2.0
+/// Format a ring size without trailing zeros: 9.0 -> "9", 8.5 -> "8.5", 8.75 -> "8.75".
+fn fmt_size(s: f64) -> String {
+    if s.fract().abs() < 1e-9 {
+        format!("{}", s as i64)
+    } else {
+        let mut t = format!("{:.2}", s);
+        while t.ends_with('0') {
+            t.pop();
+        }
+        if t.ends_with('.') {
+            t.pop();
+        }
+        t
+    }
 }
 
 /// Collect *.stl / *.obj files under `dir`, sorted, optionally recursing.
@@ -342,10 +340,7 @@ fn collect_mesh_files(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
                 }
                 continue;
             }
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_lowercase());
+            let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase());
             if matches!(ext.as_deref(), Some("stl") | Some("obj")) {
                 out.push(path);
             }
@@ -356,10 +351,11 @@ fn collect_mesh_files(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max.saturating_sub(1)])
+        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{cut}…")
     }
 }
 
@@ -368,30 +364,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_labeled_sizes() {
-        assert_eq!(parse_ring_size_from_filename("celtic-knot-size7"), Some(7.0));
-        assert_eq!(parse_ring_size_from_filename("celtic_knot_size_7.5"), Some(7.5));
-        assert_eq!(parse_ring_size_from_filename("dragon sz9"), Some(9.0));
-        assert_eq!(parse_ring_size_from_filename("band US 10"), Some(10.0));
-        assert_eq!(parse_ring_size_from_filename("band-us10.5"), Some(10.5));
+    fn parses_size_appended_to_design() {
+        assert_eq!(parse_ring("Hades9"), Some(("Hades".into(), 9.0)));
+        assert_eq!(parse_ring("AthenaRing8"), Some(("AthenaRing".into(), 8.0)));
+        assert_eq!(parse_ring("Kamon-8"), Some(("Kamon".into(), 8.0)));
+        assert_eq!(parse_ring("Kamon.stl is a stem? no"), None); // sanity: no in-range number
     }
 
     #[test]
-    fn parses_bare_size_token() {
-        assert_eq!(parse_ring_size_from_filename("celtic-knot-7"), Some(7.0));
-        assert_eq!(parse_ring_size_from_filename("ring_8.5_final"), Some(8.5));
+    fn parses_quarter_and_half_sizes() {
+        assert_eq!(parse_ring("Hades8.75"), Some(("Hades".into(), 8.75)));
+        assert_eq!(parse_ring("Kamon-11.25"), Some(("Kamon".into(), 11.25)));
+        assert_eq!(parse_ring("Kamon-11.5"), Some(("Kamon".into(), 11.5)));
+        assert_eq!(parse_ring("Hades12.5"), Some(("Hades".into(), 12.5)));
     }
 
     #[test]
-    fn rejects_when_no_size() {
-        assert_eq!(parse_ring_size_from_filename("celtic-knot-pendant"), None);
-        assert_eq!(parse_ring_size_from_filename("dragon"), None);
+    fn strips_trailing_material_word() {
+        assert_eq!(parse_ring("Hades11Bronze"), Some(("Hades".into(), 11.0)));
     }
 
     #[test]
-    fn size_range_parsing() {
-        assert_eq!(parse_size_range("5-10").unwrap(), (5.0, 10.0));
-        assert!(parse_size_range("10-5").is_err());
-        assert!(parse_size_range("abc").is_err());
+    fn keeps_distinct_blank_design() {
+        assert_eq!(parse_ring("BlankKamon-13"), Some(("BlankKamon".into(), 13.0)));
+    }
+
+    #[test]
+    fn rejects_when_no_ring_size() {
+        assert_eq!(parse_ring("UMesh_AthenaRing"), None);
+        assert_eq!(parse_ring("Kamon"), None);
+        assert_eq!(parse_ring("AthenaRing"), None);
+        assert_eq!(parse_ring("BlankSignet"), None);
+        assert_eq!(parse_ring("1-NordicAxe"), None); // 1 is below the ring range
+    }
+
+    #[test]
+    fn size_label_formatting() {
+        assert_eq!(fmt_size(9.0), "9");
+        assert_eq!(fmt_size(8.5), "8.5");
+        assert_eq!(fmt_size(8.75), "8.75");
+        assert_eq!(fmt_size(11.25), "11.25");
     }
 }
