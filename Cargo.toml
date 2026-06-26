@@ -5,26 +5,29 @@ edition = "2024"
 build = "build.rs"
 
 [dependencies]
-eframe = { version="0.33", features=["persistence", "serde",  "default_fonts", "glow", "x11"], default-features=false }
+eframe = { version="0.34.3", features=["persistence", "serde",  "default_fonts", "glow", "x11"], default-features=false }
 tokio = { version = "1.49", features = ["full", "tracing"] }
-surrealdb = { version = "3", features = ["kv-surrealkv"] }
-surrealdb-types = { version = "3" }
-egui_glow = "0.33"
-reqwest = { version = "0.13.1", features = ["json"] }
+surrealdb = { version = "3.1.4", features = ["protocol-ws"] }
+surrealdb-types = { version = "3.1.4" }
+jewelry_shared = { path = "../jewelry_shared", features = ["surreal"] }
+dotenvy = "0.15.7"
+egui_glow = "0.34.3"
+reqwest = { version = "0.13.4", features = ["json"] }
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-channel = "0.5.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rfd = "0.17.2"
-nalgebra = "0.34.1"
-egui_logger = "0.9"
+nalgebra = "0.35.0"
+egui_logger = "0.10.0"
 log = "0.4"
 anyhow = "1.0"
 byteorder = "1.5.0"
 clap = { version = "4", features = ["derive"] }
+regex = "1"
 colored = "3.0.0"
 num-format = "0.4.4"
-rayon = "1.11.0"
+rayon = "1.12.0"
 smallvec = "1.15.1"
 puffin = "0.20.0"
 puffin_http = "0.17.0"
@@ -34,6 +37,6 @@ parking_lot = "0.12"
 dotenvy = "0.15.7"
 
 [dependencies.egui]
-version = "0.33"
+version = "0.34.3"
 default-features = false
 features = ["rayon", "bytemuck"]

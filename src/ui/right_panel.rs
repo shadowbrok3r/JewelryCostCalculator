@@ -73,6 +73,13 @@ fn render_action_buttons(app: &mut JewelryCalculatorApp, ui: &mut Ui, ctx: &Cont
             app.regenerate_report();
             app.set_status("Report regenerated");
         }
+
+        // Publish to the shared catalog (OrderTracker reads it)
+        ui.add_enabled_ui(app.database_ready, |ui| {
+            if ui.button(RichText::new("📤 Publish to Catalog").color(colors::NEON_GREEN)).clicked() {
+                app.publish_to_catalog();
+            }
+        });
     });
 }
 

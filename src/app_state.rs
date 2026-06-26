@@ -47,6 +47,8 @@ pub enum AsyncMessage {
         path: PathBuf,
         result: Result<(), String>,
     },
+    /// Cost report published to the shared piece_costs catalog (row count)
+    CatalogPublished(Result<usize, String>),
 }
 
 /// Data returned when a mesh is successfully loaded
@@ -480,6 +482,16 @@ impl JewelryCalculatorApp {
                         }
                     }
                 }
+                AsyncMessage::CatalogPublished(result) => {
+                    match result {
+                        Ok(count) => {
+                            self.set_status(format!("Published {} size(s) to catalog", count));
+                        }
+                        Err(e) => {
+                            self.set_status(format!("Publish failed: {}", e));
+                        }
+                    }
+                }
             }
         }
     }
@@ -595,6 +607,27 @@ impl JewelryCalculatorApp {
                     .map_err(|e| e.to_string());
 
                 let _ = sender.send(AsyncMessage::FileSaved(result));
+            });
+        }
+    }
+
+    /// Publish the current cost report to the shared piece_costs catalog
+    pub fn publish_to_catalog(&mut self) {
+        let Some(report) = self.report.clone() else {
+            self.set_status("No report to publish");
+            return;
+        };
+        if !self.database_ready {
+            self.set_status("Database not connected");
+            return;
+        }
+        if let Some(bridge) = &self.async_bridge {
+            let sender = bridge.sender.clone();
+            bridge.spawn(async move {
+                let result = crate::database::catalog::publish_report(&report)
+                    .await
+                    .map_err(|e| e.to_string());
+                let _ = sender.send(AsyncMessage::CatalogPublished(result));
             });
         }
     }

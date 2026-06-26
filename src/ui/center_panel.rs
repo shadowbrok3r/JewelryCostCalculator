@@ -171,7 +171,7 @@ fn render_3d_preview(app: &mut JewelryCalculatorApp, ui: &mut Ui, rect: Rect, ct
 
     if response.hovered() {
         ctx.input(|i| {
-            let scroll = i.raw_scroll_delta.y;
+            let scroll = i.smooth_scroll_delta.y;
             if scroll != 0.0 {
                 app.viewer_state.camera_distance *= 1.0 - scroll * 0.001;
                 app.viewer_state.camera_distance =
