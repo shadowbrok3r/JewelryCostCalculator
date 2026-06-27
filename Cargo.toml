@@ -7,8 +7,8 @@ build = "build.rs"
 [dependencies]
 eframe = { version="0.34.3", features=["persistence", "serde",  "default_fonts", "glow", "x11"], default-features=false }
 tokio = { version = "1.49", features = ["full", "tracing"] }
-surrealdb = { version = "3.1.4", features = ["protocol-ws"] }
-surrealdb-types = { version = "3.1.4" }
+surrealdb = { version = "3.2.0-beta.2", features = ["protocol-ws"] }
+surrealdb-types = { version = "3.2.0-beta.2" }
 jewelry_shared = { path = "../jewelry_shared", features = ["surreal"] }
 dotenvy = "0.15.7"
 egui_glow = "0.34.3"
