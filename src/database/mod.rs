@@ -35,8 +35,11 @@ pub async fn init() -> anyhow::Result<()> {
     }
     info!("Connecting to SurrealDB at {}", url);
 
-    if url.starts_with("wss") {
-        DB.connect::<Wss>(url).await?;
+    // Typed Ws/Wss engines prepend the scheme; pass host only, not the full URL.
+    if let Some(host) = url.strip_prefix("wss://") {
+        DB.connect::<Wss>(host).await?;
+    } else if let Some(host) = url.strip_prefix("ws://") {
+        DB.connect::<Ws>(host).await?;
     } else {
         DB.connect::<Ws>(url).await?;
     }

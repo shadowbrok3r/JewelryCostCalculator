@@ -61,13 +61,17 @@ gold_g = $input.gold_g, gold_usd = $input.gold_usd, \
 bronze_g = $input.bronze_g, bronze_usd = $input.bronze_usd, \
 wax_usd = $input.wax_usd";
 
-/// Upsert every size of a report into piece_costs; returns the row count written.
-pub async fn publish_report(report: &CostReport) -> anyhow::Result<usize> {
-    let rows = report_to_rows(report);
+/// Upsert a batch of already-built rows in one query; returns the row count written.
+pub async fn publish_rows(rows: Vec<PieceCostRow>) -> anyhow::Result<usize> {
     if rows.is_empty() {
         return Ok(0);
     }
     let count = rows.len();
     DB.query(UPSERT).bind(("rows", rows)).await?.check()?;
     Ok(count)
+}
+
+/// Upsert every size of a report into piece_costs; returns the row count written.
+pub async fn publish_report(report: &CostReport) -> anyhow::Result<usize> {
+    publish_rows(report_to_rows(report)).await
 }

@@ -22,6 +22,8 @@ use crate::materials::calculate_all_weights;
 use crate::mesh::{load_mesh, volume::calculate_volume_cm3};
 use crate::pricing::{api::fetch_metal_prices, calculate_all_costs, MetalPrices, WaxPricing};
 use crate::report::{CostReport, JewelryType};
+use crate::ring_sizing::{calculate_scale_factor, calculate_scaled_volume, RingSize};
+use jewelry_shared::PieceCostRow;
 
 /// Plausible US ring sizes; bounds reject part numbers and version tags.
 const RING_SIZE_MIN: f64 = 3.0;
@@ -62,6 +64,15 @@ struct ScanArgs {
     /// Write a JSON scan report to this path
     #[arg(long)]
     report: Option<PathBuf>,
+    /// Fill in missing ring sizes per design by scaling the nearest modeled size (cube law)
+    #[arg(long)]
+    scale_sizes: bool,
+    /// Lowest ring size to generate with --scale-sizes
+    #[arg(long, default_value_t = 5.0)]
+    size_min: f64,
+    /// Highest ring size to generate with --scale-sizes
+    #[arg(long, default_value_t = 15.0)]
+    size_max: f64,
 }
 
 /// Handle the `scan` subcommand; returns Some(exit_code) when handled, None for GUI.
@@ -160,22 +171,45 @@ async fn run_inner(args: ScanArgs) -> Result<i32> {
         items.push(item);
     }
 
+    if args.scale_sizes {
+        let scaled = generate_scaled_sizes(&items, args.size_min, args.size_max, &prices, &wax);
+        if !args.dry_run {
+            let rows: Vec<PieceCostRow> = scaled.iter().map(|(_, r)| r.clone()).collect();
+            for chunk in rows.chunks(256) {
+                crate::database::catalog::publish_rows(chunk.to_vec()).await?;
+            }
+        }
+        for (item, _) in &scaled {
+            println!(
+                "{:<42} {:<7} {:<7} {:>10}  {}",
+                truncate(&item.file, 42),
+                item.kind,
+                item.ring_size.as_deref().unwrap_or("-"),
+                format!("{:.3}cm3", item.volume_cm3),
+                item.status
+            );
+        }
+        items.extend(scaled.into_iter().map(|(it, _)| it));
+    }
+
     let published_rows: usize = items.iter().map(|i| i.rows).sum();
     let skipped = items.iter().filter(|i| i.status.starts_with("skipped")).count();
     let errors = items.iter().filter(|i| i.status.starts_with("error")).count();
+    let scaled_rows = items.iter().filter(|i| i.kind == "scaled").count();
 
     println!(
-        "\nscanned {} file(s): {} row(s) {}, {} skipped, {} error(s)",
-        items.len(),
+        "\nscanned {} file(s): {} row(s) {} ({} scaled), {} skipped, {} error(s)",
+        files.len(),
         published_rows,
         if args.dry_run { "computed (dry-run)" } else { "published" },
+        scaled_rows,
         skipped,
         errors
     );
 
     let report = ScanReport {
         dir: args.dir.display().to_string(),
-        scanned: items.len(),
+        scanned: files.len(),
         published_rows,
         skipped,
         errors,
@@ -322,6 +356,83 @@ fn fmt_size(s: f64) -> String {
         }
         t
     }
+}
+
+/// Parse the numeric size from a "US 9" / "US 8.75" label.
+fn parse_size_label(label: &str) -> Option<f64> {
+    label.trim().strip_prefix("US ").and_then(|s| s.trim().parse::<f64>().ok())
+}
+
+/// For each ring design, generate rows for the missing sizes in [size_min, size_max]
+/// (0.5 steps) by scaling the nearest modeled size's volume by the cube of the
+/// inner-diameter ratio. Real modeled sizes are left untouched.
+fn generate_scaled_sizes(
+    real_items: &[ScanItem],
+    size_min: f64,
+    size_max: f64,
+    prices: &MetalPrices,
+    wax: &WaxPricing,
+) -> Vec<(ScanItem, PieceCostRow)> {
+    use std::collections::BTreeMap;
+    let mut by_design: BTreeMap<String, Vec<(f64, f64)>> = BTreeMap::new();
+    for it in real_items {
+        if it.kind != "ring" {
+            continue;
+        }
+        let (Some(dk), Some(rs)) = (it.design_key.as_ref(), it.ring_size.as_ref()) else {
+            continue;
+        };
+        if let Some(sz) = parse_size_label(rs) {
+            by_design.entry(dk.clone()).or_default().push((sz, it.volume_cm3));
+        }
+    }
+
+    let targets = RingSize::range(size_min, size_max);
+    let mut out = Vec::new();
+    for (design_key, reals) in &by_design {
+        if reals.is_empty() {
+            continue;
+        }
+        for t in &targets {
+            let tsz = t.0;
+            if reals.iter().any(|(s, _)| (s - tsz).abs() < 1e-6) {
+                continue;
+            }
+            let (s0, v0) = reals
+                .iter()
+                .cloned()
+                .min_by(|a, b| (a.0 - tsz).abs().partial_cmp(&(b.0 - tsz).abs()).unwrap())
+                .unwrap();
+            let scale = calculate_scale_factor(RingSize::new(s0).inner_diameter_mm(), *t);
+            let vol = calculate_scaled_volume(v0, scale);
+            let weights = calculate_all_weights(vol, None);
+            let costs = calculate_all_costs(&weights, prices, wax);
+            let label = format!("US {}", fmt_size(tsz));
+            let mut r = CostReport::new_pendant(design_key.clone(), vol, &costs, prices);
+            r.jewelry_type = JewelryType::Ring;
+            r.sizes[0].ring_size = label.clone();
+            let Some(row) = crate::database::catalog::report_to_rows(&r).into_iter().next() else {
+                continue;
+            };
+            let silver_usd = r
+                .sizes
+                .first()
+                .and_then(|s| s.materials.get("silver"))
+                .map(|m| m.price_usd);
+            let item = ScanItem {
+                file: format!("{design_key} \u{2192} {label}"),
+                design_key: Some(design_key.clone()),
+                kind: "scaled".into(),
+                ring_size: Some(label),
+                volume_cm3: vol,
+                silver_usd,
+                rows: 1,
+                status: format!("scaled from US {}", fmt_size(s0)),
+            };
+            out.push((item, row));
+        }
+    }
+    out
 }
 
 /// Collect *.stl / *.obj files under `dir`, sorted, optionally recursing.
