@@ -524,56 +524,99 @@ fn largest_empty_circle(pts: &[(f64, f64)]) -> ((f64, f64), f64) {
     (best_c, best_r)
 }
 
-/// Measure the inner bore for one candidate finger-axis direction `n`: slab the
-/// vertices through the band perpendicular to `n`, project onto the plane, and
-/// fit the largest empty circle. Returns the bore (3D center, diameter, coverage).
+/// Number of axial positions probed per candidate axis.
+const BORE_POSITIONS: usize = 5;
+
+/// Measure the inner bore for one candidate finger-axis direction `n`. Probes
+/// several axial positions (not just the median) so a single slab landing in a
+/// localized void / ornate cavity can't decide the answer. The real finger bore
+/// is the empty circle that recurs consistently across positions (a through-
+/// cylinder); the returned `coverage` folds in that axial consistency, so an axis
+/// whose "bore" appears at only a few positions scores low.
 fn bore_for_axis(coords: &[[f64; 3]], centroid: [f64; 3], n: [f64; 3]) -> Option<InnerBore> {
     let (u, v) = plane_basis(n);
     let mut tvals: Vec<f64> = coords.iter().map(|c| vdot(vsub(*c, centroid), n)).collect();
     tvals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let t_med = tvals[tvals.len() / 2];
-    let span = tvals[tvals.len() - 1] - tvals[0];
-    let half = (span * 0.05).max(0.8);
+    let pct = |q: f64| tvals[((tvals.len() as f64 * q) as usize).min(tvals.len() - 1)];
+    let half = ((tvals[tvals.len() - 1] - tvals[0]) * 0.05).max(0.8);
 
-    let slab: Vec<(f64, f64)> = coords
-        .iter()
-        .filter(|c| (vdot(vsub(**c, centroid), n) - t_med).abs() <= half)
-        .map(|c| {
-            let d = vsub(*c, centroid);
-            (vdot(d, u), vdot(d, v))
-        })
-        .collect();
-    if slab.len() < 100 {
-        return None;
-    }
-    let step = (slab.len() / 4000).max(1);
-    let sub: Vec<(f64, f64)> = slab.iter().copied().step_by(step).collect();
-    let (c2d, r) = largest_empty_circle(&sub);
-    let diameter = r * 2.0;
+    // Largest empty circle at one axial slab position: (diameter, coverage, center2d).
+    let measure_at = |t_pos: f64| -> Option<(f64, f64, (f64, f64))> {
+        let slab: Vec<(f64, f64)> = coords
+            .iter()
+            .filter(|c| (vdot(vsub(**c, centroid), n) - t_pos).abs() <= half)
+            .map(|c| {
+                let d = vsub(*c, centroid);
+                (vdot(d, u), vdot(d, v))
+            })
+            .collect();
+        if slab.len() < 100 {
+            return None;
+        }
+        let step = (slab.len() / 4000).max(1);
+        let sub: Vec<(f64, f64)> = slab.iter().copied().step_by(step).collect();
+        let (c2d, r) = largest_empty_circle(&sub);
+        let mut buckets = [false; 72];
+        for &(x, y) in &slab {
+            let d = (x - c2d.0).hypot(y - c2d.1);
+            if d >= r && d <= r + 1.0 {
+                let ang = (y - c2d.1).atan2(x - c2d.0) + std::f64::consts::PI;
+                buckets[((ang / (2.0 * std::f64::consts::PI)) * 72.0) as usize % 72] = true;
+            }
+        }
+        let coverage = buckets.iter().filter(|b| **b).count() as f64 / 72.0;
+        Some((r * 2.0, coverage, c2d))
+    };
 
-    let mut buckets = [false; 72];
-    for &(x, y) in &slab {
-        let d = (x - c2d.0).hypot(y - c2d.1);
-        if d >= r && d <= r + 1.0 {
-            let ang = (y - c2d.1).atan2(x - c2d.0) + std::f64::consts::PI;
-            let b = ((ang / (2.0 * std::f64::consts::PI)) * 72.0) as usize;
-            buckets[b.min(71)] = true;
+    // Sample at axial percentiles 20..80% (so one position is exactly the median,
+    // where a clean band slab lives, plus four flanking it).
+    let mut results: Vec<(f64, f64, (f64, f64), f64)> = Vec::new(); // (diam, cov, c2d, t_pos)
+    for i in 0..BORE_POSITIONS {
+        let t_pos = pct(0.2 + 0.6 * i as f64 / (BORE_POSITIONS as f64 - 1.0));
+        if let Some((d, cov, c2d)) = measure_at(t_pos) {
+            results.push((d, cov, c2d, t_pos));
         }
     }
-    let coverage = buckets.iter().filter(|b| **b).count() as f64 / 72.0;
+    if results.is_empty() {
+        return None;
+    }
+
+    // A real finger bore: a well-covered, plausibly-sized circle present at many
+    // axial positions. Take the median diameter of those, and fold the fraction of
+    // positions that agree into the coverage (penalizes one-off voids). An axis
+    // with no qualifying through-bore at any position is disqualified (None) rather
+    // than given a fabricated bore that could win the search with a spurious void.
+    let qual: Vec<&(f64, f64, (f64, f64), f64)> = results
+        .iter()
+        .filter(|(d, cov, _, _)| *cov >= 0.5 && (12.0..=25.5).contains(d))
+        .collect();
+    if qual.is_empty() {
+        return None;
+    }
+    let mut ds: Vec<f64> = qual.iter().map(|q| q.0).collect();
+    ds.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let med_d = ds[ds.len() / 2];
+    let chosen = **qual
+        .iter()
+        .min_by(|a, b| (a.0 - med_d).abs().partial_cmp(&(b.0 - med_d).abs()).unwrap())
+        .unwrap();
+    let mean_cov = qual.iter().map(|q| q.1).sum::<f64>() / qual.len() as f64;
+    let axial_cov = mean_cov * (qual.len() as f64 / results.len() as f64);
+
+    let (diam, _, c2d, t_pos) = chosen;
     let center = [
-        centroid[0] + u[0] * c2d.0 + v[0] * c2d.1 + n[0] * t_med,
-        centroid[1] + u[1] * c2d.0 + v[1] * c2d.1 + n[1] * t_med,
-        centroid[2] + u[2] * c2d.0 + v[2] * c2d.1 + n[2] * t_med,
+        centroid[0] + u[0] * c2d.0 + v[0] * c2d.1 + n[0] * t_pos,
+        centroid[1] + u[1] * c2d.0 + v[1] * c2d.1 + n[1] * t_pos,
+        centroid[2] + u[2] * c2d.0 + v[2] * c2d.1 + n[2] * t_pos,
     ];
-    Some(InnerBore { axis_dir: n, center, diameter_mm: diameter, coverage })
+    Some(InnerBore { axis_dir: n, center, diameter_mm: diam, coverage: axial_cov })
 }
 
 /// Score a candidate bore: coverage dominates (the true finger axis is the only
 /// direction whose inscribed circle has full angular wall coverage); a plausible
 /// diameter breaks ties toward the larger empty cylinder.
 fn bore_score(b: &InnerBore) -> f64 {
-    let plausible = (12.0..=24.0).contains(&b.diameter_mm);
+    let plausible = (12.0..=25.5).contains(&b.diameter_mm);
     b.coverage * 100.0 + if plausible { b.diameter_mm } else { -100.0 }
 }
 
@@ -674,7 +717,7 @@ pub fn measure_inner_bore(coords_full: &[[f64; 3]]) -> Option<InnerBore> {
 
     // Re-measure the winning axis at full resolution for a precise diameter.
     if let Some(b) = bore_for_axis(coords_full, centroid_of(coords_full), best.axis_dir) {
-        if (12.0..=24.0).contains(&b.diameter_mm) {
+        if (12.0..=25.5).contains(&b.diameter_mm) {
             best = b;
         }
     }
