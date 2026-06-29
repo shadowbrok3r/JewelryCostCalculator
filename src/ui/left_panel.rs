@@ -103,13 +103,15 @@ fn open_file_dialog(app: &mut JewelryCalculatorApp, ctx: &Context) {
                         crate::mesh::load_mesh(&path)
                             .map(|mesh| {
                                 use crate::mesh::volume::{calculate_volume, calculate_volume_cm3};
-                                use crate::ring_sizing::detect_ring_hole;
-                                
+                                use crate::ring_sizing::measure_inner_diameter;
+
                                 let volume_mm3 = calculate_volume(&mesh);
                                 let volume_cm3 = calculate_volume_cm3(&mesh);
                                 let triangle_count = mesh.triangle_count();
                                 mesh.warm_cache();
-                                let detected_hole = detect_ring_hole(&mesh);
+                                let detected_hole = measure_inner_diameter(&mesh)
+                                    .filter(|b| b.coverage >= 0.5)
+                                    .map(|b| b.to_detected_hole());
 
                                 crate::app_state::LoadedMeshData {
                                     mesh,

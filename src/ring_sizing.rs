@@ -414,6 +414,295 @@ pub fn calculate_scaled_volume(original_volume: f64, scale_factor: f64) -> f64 {
     original_volume * scale_factor.powi(3)
 }
 
+/// A robust inner-bore measurement: the largest empty cylinder threading the ring.
+#[derive(Debug, Clone, Copy)]
+pub struct InnerBore {
+    /// Unit direction of the finger axis (may be non-cardinal for tilted models).
+    pub axis_dir: [f64; 3],
+    /// A point on the bore axis (the bore center).
+    pub center: [f64; 3],
+    pub diameter_mm: f64,
+    /// Angular coverage of the bore wall (0..1); proxy for confidence.
+    pub coverage: f64,
+}
+
+#[inline]
+fn vsub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+#[inline]
+fn vdot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+#[inline]
+fn vcross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+#[inline]
+fn vnorm(a: [f64; 3]) -> [f64; 3] {
+    let l = vdot(a, a).sqrt();
+    if l < 1e-12 {
+        a
+    } else {
+        [a[0] / l, a[1] / l, a[2] / l]
+    }
+}
+
+/// Orthonormal basis (u, v) spanning the plane perpendicular to unit `n`.
+fn plane_basis(n: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+    let (ax, ay, az) = (n[0].abs(), n[1].abs(), n[2].abs());
+    let e = if ax <= ay && ax <= az {
+        [1.0, 0.0, 0.0]
+    } else if ay <= az {
+        [0.0, 1.0, 0.0]
+    } else {
+        [0.0, 0.0, 1.0]
+    };
+    let u = vnorm(vcross(n, e));
+    let v = vcross(n, u);
+    (u, v)
+}
+
+/// Tilt unit `n` by `ang` radians toward unit `axis` (axis ⊥ n).
+fn tilt(n: [f64; 3], axis: [f64; 3], ang: f64) -> [f64; 3] {
+    let (s, c) = ang.sin_cos();
+    vnorm([
+        n[0] * c + axis[0] * s,
+        n[1] * c + axis[1] * s,
+        n[2] * c + axis[2] * s,
+    ])
+}
+
+/// Distance from (px,py) to the nearest of `pts`.
+fn nearest_dist(px: f64, py: f64, pts: &[(f64, f64)]) -> f64 {
+    let mut best = f64::INFINITY;
+    for &(x, y) in pts {
+        let d = (x - px).powi(2) + (y - py).powi(2);
+        if d < best {
+            best = d;
+        }
+    }
+    best.sqrt()
+}
+
+/// Largest circle centered in `pts`' bbox that contains no point (pole of
+/// inaccessibility), via grid refinement. Returns (center, radius).
+fn largest_empty_circle(pts: &[(f64, f64)]) -> ((f64, f64), f64) {
+    let (mut bx0, mut bx1) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut by0, mut by1) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &(x, y) in pts {
+        bx0 = bx0.min(x);
+        bx1 = bx1.max(x);
+        by0 = by0.min(y);
+        by1 = by1.max(y);
+    }
+    let mut best_c = ((bx0 + bx1) * 0.5, (by0 + by1) * 0.5);
+    let mut best_r = nearest_dist(best_c.0, best_c.1, pts);
+    for _ in 0..7 {
+        let gx = (bx1 - bx0) / 8.0;
+        let gy = (by1 - by0) / 8.0;
+        for i in 0..=8 {
+            for j in 0..=8 {
+                let cx = bx0 + gx * i as f64;
+                let cy = by0 + gy * j as f64;
+                let r = nearest_dist(cx, cy, pts);
+                if r > best_r {
+                    best_r = r;
+                    best_c = (cx, cy);
+                }
+            }
+        }
+        bx0 = best_c.0 - gx;
+        bx1 = best_c.0 + gx;
+        by0 = best_c.1 - gy;
+        by1 = best_c.1 + gy;
+    }
+    (best_c, best_r)
+}
+
+/// Measure the inner bore for one candidate finger-axis direction `n`: slab the
+/// vertices through the band perpendicular to `n`, project onto the plane, and
+/// fit the largest empty circle. Returns the bore (3D center, diameter, coverage).
+fn bore_for_axis(coords: &[[f64; 3]], centroid: [f64; 3], n: [f64; 3]) -> Option<InnerBore> {
+    let (u, v) = plane_basis(n);
+    let mut tvals: Vec<f64> = coords.iter().map(|c| vdot(vsub(*c, centroid), n)).collect();
+    tvals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let t_med = tvals[tvals.len() / 2];
+    let span = tvals[tvals.len() - 1] - tvals[0];
+    let half = (span * 0.05).max(0.8);
+
+    let slab: Vec<(f64, f64)> = coords
+        .iter()
+        .filter(|c| (vdot(vsub(**c, centroid), n) - t_med).abs() <= half)
+        .map(|c| {
+            let d = vsub(*c, centroid);
+            (vdot(d, u), vdot(d, v))
+        })
+        .collect();
+    if slab.len() < 100 {
+        return None;
+    }
+    let step = (slab.len() / 4000).max(1);
+    let sub: Vec<(f64, f64)> = slab.iter().copied().step_by(step).collect();
+    let (c2d, r) = largest_empty_circle(&sub);
+    let diameter = r * 2.0;
+
+    let mut buckets = [false; 72];
+    for &(x, y) in &slab {
+        let d = (x - c2d.0).hypot(y - c2d.1);
+        if d >= r && d <= r + 1.0 {
+            let ang = (y - c2d.1).atan2(x - c2d.0) + std::f64::consts::PI;
+            let b = ((ang / (2.0 * std::f64::consts::PI)) * 72.0) as usize;
+            buckets[b.min(71)] = true;
+        }
+    }
+    let coverage = buckets.iter().filter(|b| **b).count() as f64 / 72.0;
+    let center = [
+        centroid[0] + u[0] * c2d.0 + v[0] * c2d.1 + n[0] * t_med,
+        centroid[1] + u[1] * c2d.0 + v[1] * c2d.1 + n[1] * t_med,
+        centroid[2] + u[2] * c2d.0 + v[2] * c2d.1 + n[2] * t_med,
+    ];
+    Some(InnerBore { axis_dir: n, center, diameter_mm: diameter, coverage })
+}
+
+/// Score a candidate bore: coverage dominates (the true finger axis is the only
+/// direction whose inscribed circle has full angular wall coverage); a plausible
+/// diameter breaks ties toward the larger empty cylinder.
+fn bore_score(b: &InnerBore) -> f64 {
+    let plausible = (12.0..=24.0).contains(&b.diameter_mm);
+    b.coverage * 100.0 + if plausible { b.diameter_mm } else { -100.0 }
+}
+
+/// Measure a ring's inner finger-bore diameter as the largest empty cylinder
+/// threading the band — robust to tall settings, galleries, stacked bands, an
+/// off-center hole, AND a non-cardinal (tilted) finger axis.
+///
+/// The bore center is found by a largest-empty-circle fit (so it self-corrects
+/// instead of assuming the bbox center); the finger axis is found by searching
+/// orientations and keeping the one whose inscribed circle has the fullest wall
+/// coverage and largest plausible diameter. A hemisphere seed sweep locates the
+/// basin, then a shrinking local tilt search refines the axis.
+pub fn measure_inner_diameter(mesh: &Mesh) -> Option<InnerBore> {
+    let coords_full: Vec<[f64; 3]> = mesh
+        .vertices
+        .iter()
+        .map(|v| [v.0 as f64, v.1 as f64, v.2 as f64])
+        .collect();
+    measure_inner_bore(&coords_full)
+}
+
+/// Core of [`measure_inner_diameter`] over a raw vertex cloud (unit-testable and
+/// orientation-independent): returns the largest empty cylinder threading it.
+pub fn measure_inner_bore(coords_full: &[[f64; 3]]) -> Option<InnerBore> {
+    if coords_full.len() < 100 {
+        return None;
+    }
+    let centroid_of = |pts: &[[f64; 3]]| -> [f64; 3] {
+        let n = pts.len() as f64;
+        [
+            pts.iter().map(|c| c[0]).sum::<f64>() / n,
+            pts.iter().map(|c| c[1]).sum::<f64>() / n,
+            pts.iter().map(|c| c[2]).sum::<f64>() / n,
+        ]
+    };
+    // The axis search runs over a subsample (keeps each candidate eval cheap on
+    // dense meshes); the winning axis is re-measured at full resolution below.
+    let step = (coords_full.len() / 6000).max(1);
+    let coords: Vec<[f64; 3]> = coords_full.iter().step_by(step).copied().collect();
+    let centroid = centroid_of(&coords);
+
+    // Seed directions: the 3 cardinal axes + a Fibonacci hemisphere sweep (n ≡ -n,
+    // so fold to the upper hemisphere). Covers tilted finger axes the cardinals miss.
+    let mut seeds: Vec<[f64; 3]> = vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let m = 96usize;
+    let golden = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
+    for i in 0..m {
+        let y = 1.0 - (i as f64 + 0.5) / m as f64; // 1 -> ~0
+        let rad = (1.0 - y * y).max(0.0).sqrt();
+        let phi = i as f64 * golden;
+        let mut dir = [rad * phi.cos(), y, rad * phi.sin()];
+        if dir[1] < 0.0 {
+            dir = [-dir[0], -dir[1], -dir[2]];
+        }
+        seeds.push(vnorm(dir));
+    }
+
+    let mut best: Option<InnerBore> = None;
+    let mut best_score = f64::NEG_INFINITY;
+    for s in &seeds {
+        if let Some(b) = bore_for_axis(&coords, centroid, *s) {
+            let sc = bore_score(&b);
+            if sc > best_score {
+                best_score = sc;
+                best = Some(b);
+            }
+        }
+    }
+    let mut best = best?;
+
+    // Local refinement: tilt the axis by shrinking angles, hill-climbing the score.
+    for &deg in &[8.0_f64, 4.0, 2.0, 1.0, 0.5] {
+        let ang = deg.to_radians();
+        loop {
+            let (u, v) = plane_basis(best.axis_dir);
+            let cands = [
+                tilt(best.axis_dir, u, ang),
+                tilt(best.axis_dir, u, -ang),
+                tilt(best.axis_dir, v, ang),
+                tilt(best.axis_dir, v, -ang),
+            ];
+            let mut improved = false;
+            for c in cands {
+                if let Some(b) = bore_for_axis(&coords, centroid, c) {
+                    let sc = bore_score(&b);
+                    if sc > best_score {
+                        best_score = sc;
+                        best = b;
+                        improved = true;
+                    }
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+    }
+
+    // Re-measure the winning axis at full resolution for a precise diameter.
+    if let Some(b) = bore_for_axis(coords_full, centroid_of(coords_full), best.axis_dir) {
+        if (12.0..=24.0).contains(&b.diameter_mm) {
+            best = b;
+        }
+    }
+    Some(best)
+}
+
+impl InnerBore {
+    /// Adapt to the GUI overlay's `DetectedRingHole` (coverage → confidence;
+    /// axis_dir kept for correct tilted-circle rendering; `axis` = dominant cardinal).
+    pub fn to_detected_hole(&self) -> DetectedRingHole {
+        let a = self.axis_dir;
+        let axis = if a[0].abs() >= a[1].abs() && a[0].abs() >= a[2].abs() {
+            0
+        } else if a[1].abs() >= a[2].abs() {
+            1
+        } else {
+            2
+        };
+        DetectedRingHole {
+            center: self.center,
+            diameter_mm: self.diameter_mm,
+            confidence: self.coverage,
+            axis,
+            axis_direction: self.axis_dir,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +760,69 @@ mod tests {
         let diameter = size_9.inner_diameter_mm();
         // Size 9 should be approximately 19.0mm diameter
         assert!((diameter - 19.0).abs() < 0.5, "Size 9 diameter was {}", diameter);
+    }
+
+    /// Surface points of a torus in the XY plane (finger axis = Z).
+    fn torus_points(major_r: f64, tube_r: f64, nu: usize, nv: usize) -> Vec<[f64; 3]> {
+        let tau = 2.0 * std::f64::consts::PI;
+        let mut pts = Vec::with_capacity(nu * nv);
+        for i in 0..nu {
+            let u = tau * i as f64 / nu as f64;
+            for j in 0..nv {
+                let v = tau * j as f64 / nv as f64;
+                let r = major_r + tube_r * v.cos();
+                pts.push([r * u.cos(), r * u.sin(), tube_r * v.sin()]);
+            }
+        }
+        pts
+    }
+
+    /// Rotate a point cloud by Z*Y*X Euler degrees.
+    fn rotate(pts: &[[f64; 3]], rx: f64, ry: f64, rz: f64) -> Vec<[f64; 3]> {
+        let (sx, cx) = rx.to_radians().sin_cos();
+        let (sy, cy) = ry.to_radians().sin_cos();
+        let (sz, cz) = rz.to_radians().sin_cos();
+        let r = [
+            [cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
+            [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
+            [-sy, cy * sx, cy * cx],
+        ];
+        pts.iter()
+            .map(|p| {
+                [
+                    r[0][0] * p[0] + r[0][1] * p[1] + r[0][2] * p[2],
+                    r[1][0] * p[0] + r[1][1] * p[1] + r[1][2] * p[2],
+                    r[2][0] * p[0] + r[2][1] * p[1] + r[2][2] * p[2],
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bore_measures_torus_and_is_rotation_invariant() {
+        // Bore radius = major - tube = 8.675 -> Ø17.35mm (~US 7).
+        let pts = torus_points(11.175, 2.5, 96, 48);
+        let base = measure_inner_bore(&pts).expect("torus bore");
+        assert!(
+            (base.diameter_mm - 17.35).abs() < 0.7,
+            "axis-aligned Ø{:.2} expected ~17.35",
+            base.diameter_mm
+        );
+        assert!(base.coverage > 0.85, "coverage {:.2}", base.coverage);
+
+        // Under arbitrary rotation the size must hold and the axis must track Z.
+        for (rx, ry, rz) in [(37.0, 53.0, 19.0), (80.0, 15.0, 65.0)] {
+            let rp = rotate(&pts, rx, ry, rz);
+            let b = measure_inner_bore(&rp).expect("rotated torus bore");
+            assert!(
+                (b.diameter_mm - base.diameter_mm).abs() < 0.5,
+                "rotated Ø{:.2} vs base Ø{:.2}",
+                b.diameter_mm,
+                base.diameter_mm
+            );
+            let z = rotate(&[[0.0, 0.0, 1.0]], rx, ry, rz)[0];
+            let dot = (b.axis_dir[0] * z[0] + b.axis_dir[1] * z[1] + b.axis_dir[2] * z[2]).abs();
+            assert!(dot > 0.95, "axis·Z = {:.3}, axis {:?}", dot, b.axis_dir);
+        }
     }
 }

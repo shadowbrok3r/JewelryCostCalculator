@@ -845,7 +845,7 @@ impl JewelryCalculatorApp {
 /// Load mesh from file (blocking)
 fn load_mesh_blocking(path: &PathBuf) -> Result<LoadedMeshData, String> {
     use crate::mesh::{load_mesh, volume::calculate_volume_cm3};
-    use crate::ring_sizing::detect_ring_hole;
+    use crate::ring_sizing::measure_inner_diameter;
     use log::{info, warn};
 
     let filename = path.file_name()
@@ -914,7 +914,9 @@ fn load_mesh_blocking(path: &PathBuf) -> Result<LoadedMeshData, String> {
     info!("Volume: {:.3} cm³ ({:.1} mm³)", volume_cm3, volume_mm3);
     info!("Triangle count: {}", triangle_count);
 
-    let detected_hole = detect_ring_hole(&mesh);
+    let detected_hole = measure_inner_diameter(&mesh)
+        .filter(|b| b.coverage >= 0.5)
+        .map(|b| b.to_detected_hole());
     if let Some(ref hole) = detected_hole {
         info!("Detected ring hole: 📏 {:.2}mm at ({:.1}, {:.1}, {:.1}), confidence: {:.0}%",
             hole.diameter_mm, hole.center[0], hole.center[1], hole.center[2], hole.confidence * 100.0);

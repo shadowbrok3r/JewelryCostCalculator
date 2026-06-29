@@ -574,11 +574,45 @@ fn draw_detected_hole_3d(
     let circle_color = Color32::from_rgba_unmultiplied(33, 252, 190, 200);
     let circle_stroke = Stroke::new(2.5, circle_color);
 
-    let (perp1, perp2): ([f64; 3], [f64; 3]) = match hole.axis {
-        0 => ([0.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
-        1 => ([1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
-        _ => ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+    // Orient the circle in the plane perpendicular to the detected axis direction
+    // (a non-cardinal axis would render wrong if we only keyed off hole.axis).
+    let n = {
+        let d = hole.axis_direction;
+        let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if l > 1e-9 {
+            [d[0] / l, d[1] / l, d[2] / l]
+        } else {
+            match hole.axis {
+                0 => [1.0, 0.0, 0.0],
+                1 => [0.0, 1.0, 0.0],
+                _ => [0.0, 0.0, 1.0],
+            }
+        }
     };
+    let e = {
+        let (ax, ay, az) = (n[0].abs(), n[1].abs(), n[2].abs());
+        if ax <= ay && ax <= az {
+            [1.0, 0.0, 0.0]
+        } else if ay <= az {
+            [0.0, 1.0, 0.0]
+        } else {
+            [0.0, 0.0, 1.0]
+        }
+    };
+    let perp1 = {
+        let c = [
+            n[1] * e[2] - n[2] * e[1],
+            n[2] * e[0] - n[0] * e[2],
+            n[0] * e[1] - n[1] * e[0],
+        ];
+        let l = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+        [c[0] / l, c[1] / l, c[2] / l]
+    };
+    let perp2: [f64; 3] = [
+        n[1] * perp1[2] - n[2] * perp1[1],
+        n[2] * perp1[0] - n[0] * perp1[2],
+        n[0] * perp1[1] - n[1] * perp1[0],
+    ];
 
     let mut circle_points: Vec<Pos2> = Vec::with_capacity(num_segments + 1);
     for i in 0..=num_segments {

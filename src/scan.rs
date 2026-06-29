@@ -22,7 +22,10 @@ use crate::materials::calculate_all_weights;
 use crate::mesh::{load_mesh, volume::calculate_volume_cm3};
 use crate::pricing::{api::fetch_metal_prices, calculate_all_costs, MetalPrices, WaxPricing};
 use crate::report::{CostReport, JewelryType};
-use crate::ring_sizing::{calculate_scale_factor, calculate_scaled_volume, RingSize};
+use crate::ring_sizing::{
+    calculate_scale_factor, calculate_scaled_volume, detect_ring_hole, measure_inner_diameter,
+    RingSize,
+};
 use jewelry_shared::PieceCostRow;
 
 /// Plausible US ring sizes; bounds reject part numbers and version tags.
@@ -40,6 +43,17 @@ struct Cli {
 enum Commands {
     /// Cost every STL/OBJ in a folder and publish to the shared catalog
     Scan(ScanArgs),
+    /// Detect the modeled US ring size from a mesh's inner-hole geometry
+    Detect(DetectArgs),
+}
+
+#[derive(Args)]
+struct DetectArgs {
+    /// STL/OBJ file, or a directory of them
+    path: PathBuf,
+    /// Recurse into subdirectories when given a directory
+    #[arg(long)]
+    recursive: bool,
 }
 
 #[derive(Args)]
@@ -77,12 +91,74 @@ struct ScanArgs {
 
 /// Handle the `scan` subcommand; returns Some(exit_code) when handled, None for GUI.
 pub async fn dispatch() -> Option<i32> {
-    if std::env::args().nth(1).as_deref() != Some("scan") {
+    if !matches!(std::env::args().nth(1).as_deref(), Some("scan") | Some("detect")) {
         return None;
     }
     let cli = Cli::parse();
     match cli.command {
         Commands::Scan(args) => Some(run(args).await),
+        Commands::Detect(args) => Some(run_detect(args)),
+    }
+}
+
+/// Report the detected inner-hole ring size for each mesh (no DB writes).
+fn run_detect(args: DetectArgs) -> i32 {
+    let files = if args.path.is_dir() {
+        match collect_mesh_files(&args.path, args.recursive) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("detect failed: {e:#}");
+                return 1;
+            }
+        }
+    } else {
+        vec![args.path.clone()]
+    };
+
+    let mut errors = 0;
+    for path in &files {
+        let file = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        let mesh = match load_mesh(path) {
+            Ok(m) => m,
+            Err(e) => {
+                println!("{file}: error: load failed ({e})");
+                errors += 1;
+                continue;
+            }
+        };
+        let vol = calculate_volume_cm3(&mesh);
+        let axis_name = |a: usize| ["X", "Y", "Z"].get(a).copied().unwrap_or("?");
+        match measure_inner_diameter(&mesh) {
+            Some(b) => {
+                let size = RingSize::from_diameter_mm(b.diameter_mm);
+                println!(
+                    "{file}: inner Ø {:.2} mm -> {} (coverage {:.0}%, axis [{:.2} {:.2} {:.2}]), volume {:.3} cm3",
+                    b.diameter_mm,
+                    size.display(),
+                    b.coverage * 100.0,
+                    b.axis_dir[0],
+                    b.axis_dir[1],
+                    b.axis_dir[2],
+                    vol
+                );
+            }
+            None => println!("{file}: no ring bore measured, volume {:.3} cm3", vol),
+        }
+        // Cross-check with the legacy ray-cast detector for transparency.
+        if let Some(h) = detect_ring_hole(&mesh) {
+            println!(
+                "    (ray-cast cross-check: Ø {:.2} mm -> {}, confidence {:.0}%, axis {})",
+                h.diameter_mm,
+                RingSize::from_diameter_mm(h.diameter_mm).display(),
+                h.confidence * 100.0,
+                axis_name(h.axis)
+            );
+        }
+    }
+    if errors > 0 {
+        1
+    } else {
+        0
     }
 }
 
