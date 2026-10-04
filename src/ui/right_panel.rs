@@ -20,7 +20,7 @@ mod colors {
 }
 
 /// Render the right panel with the cost report
-pub fn render(app: &mut JewelryCalculatorApp, ui: &mut Ui, ctx: &Context) {
+pub fn render(app: &mut JewelryCalculatorApp, ui: &mut Ui) {
     ui.heading(RichText::new("Cost Report").color(colors::NEON_CYAN));
 
     if !app.has_mesh() {
@@ -37,7 +37,7 @@ pub fn render(app: &mut JewelryCalculatorApp, ui: &mut Ui, ctx: &Context) {
     }
 
     // Action buttons
-    render_action_buttons(app, ui, ctx);
+    render_action_buttons(app, ui);
 
     ui.separator();
 
@@ -55,17 +55,17 @@ pub fn render(app: &mut JewelryCalculatorApp, ui: &mut Ui, ctx: &Context) {
 }
 
 /// Render action buttons (save)
-fn render_action_buttons(app: &mut JewelryCalculatorApp, ui: &mut Ui, ctx: &Context) {
+fn render_action_buttons(app: &mut JewelryCalculatorApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
         // Copy to clipboard
         if ui.button(RichText::new("📋 Copy JSON").color(colors::NEON_BLUE)).clicked() {
-            ctx.copy_text(app.report_json.clone());
+            ui.ctx().copy_text(app.report_json.clone());
             app.set_status("Report copied to clipboard");
         }
 
         // Save to file
         if ui.button(RichText::new("💾 Save JSON...").color(colors::NEON_PURPLE)).clicked() {
-            save_report_dialog(app, ctx);
+            save_report_dialog(app, ui.ctx());
         }
 
         // Regenerate

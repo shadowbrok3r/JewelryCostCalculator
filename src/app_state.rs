@@ -332,6 +332,13 @@ impl JewelryCalculatorApp {
         }
     }
 
+    /// Request continuous repaints while loading or profiling
+    pub fn request_repaint_while_busy(&self, ctx: &egui::Context) {
+        if self.mesh_loading || self.prices_loading || puffin::are_scopes_on() {
+            ctx.request_repaint();
+        }
+    }
+
     /// Process incoming async messages
     pub fn process_async_messages(&mut self) {
         // Collect all messages first to avoid borrow issues

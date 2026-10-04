@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use egui::{Context, Ui, Color32, Rect, Pos2, Stroke, Vec2, RichText};
+use egui::{Ui, Color32, Rect, Pos2, Stroke, Vec2, RichText};
 
 use crate::app_state::JewelryCalculatorApp;
 use crate::ring_sizing::DetectedRingHole;
@@ -33,7 +33,7 @@ mod colors {
 }
 
 /// Render the center panel with 3D viewer
-pub fn render(app: &mut JewelryCalculatorApp, ui: &mut Ui, ctx: &Context) {
+pub fn render(app: &mut JewelryCalculatorApp, ui: &mut Ui) {
     puffin::profile_function!();
 
     let available_size = ui.available_size();
@@ -48,7 +48,7 @@ pub fn render(app: &mut JewelryCalculatorApp, ui: &mut Ui, ctx: &Context) {
         ui.separator();
 
         let preview_rect = ui.available_rect_before_wrap();
-        render_3d_preview(app, ui, preview_rect, ctx);
+        render_3d_preview(app, ui, preview_rect);
     });
 }
 
@@ -158,7 +158,7 @@ fn render_viewer_controls(app: &mut JewelryCalculatorApp, ui: &mut Ui) {
 // 3D preview with GPU mesh rendering
 // ---------------------------------------------------------------------------
 
-fn render_3d_preview(app: &mut JewelryCalculatorApp, ui: &mut Ui, rect: Rect, ctx: &Context) {
+fn render_3d_preview(app: &mut JewelryCalculatorApp, ui: &mut Ui, rect: Rect) {
     puffin::profile_function!();
     let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
@@ -170,7 +170,7 @@ fn render_3d_preview(app: &mut JewelryCalculatorApp, ui: &mut Ui, rect: Rect, ct
     }
 
     if response.hovered() {
-        ctx.input(|i| {
+        ui.input(|i| {
             let scroll = i.smooth_scroll_delta.y;
             if scroll != 0.0 {
                 app.viewer_state.camera_distance *= 1.0 - scroll * 0.001;

@@ -11,12 +11,12 @@ use crate::database::files::ExportFormat;
 use crate::METAL_API_KEY;
 
 /// Render the left panel
-pub fn render(app: &mut JewelryCalculatorApp, ui: &mut Ui, ctx: &Context) {
+pub fn render(app: &mut JewelryCalculatorApp, ui: &mut Ui) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 8.0;
 
         // File section
-        render_file_section(app, ui, ctx);
+        render_file_section(app, ui);
 
         ui.add_space(8.0);
         ui.separator();
@@ -36,7 +36,7 @@ pub fn render(app: &mut JewelryCalculatorApp, ui: &mut Ui, ctx: &Context) {
 
         // Ring sizing section (only for rings)
         if app.jewelry_type == JewelryType::Ring {
-            render_ring_section(app, ui, ctx);
+            render_ring_section(app, ui);
             ui.add_space(8.0);
             ui.separator();
         }
@@ -53,12 +53,12 @@ pub fn render(app: &mut JewelryCalculatorApp, ui: &mut Ui, ctx: &Context) {
 }
 
 /// File loading section
-fn render_file_section(app: &mut JewelryCalculatorApp, ui: &mut Ui, ctx: &Context) {
+fn render_file_section(app: &mut JewelryCalculatorApp, ui: &mut Ui) {
     ui.heading("File");
 
     ui.horizontal(|ui| {
         if ui.button("Open STL/OBJ...").clicked() {
-            open_file_dialog(app, ctx);
+            open_file_dialog(app, ui.ctx());
         }
 
         if app.mesh_loading {
@@ -78,7 +78,7 @@ fn render_file_section(app: &mut JewelryCalculatorApp, ui: &mut Ui, ctx: &Contex
     ui.label(RichText::new("(or drag & drop a file)").small().weak());
 
     // Handle dropped files
-    handle_dropped_files(app, ctx);
+    handle_dropped_files(app, ui);
 }
 
 /// Open file dialog
@@ -133,17 +133,16 @@ fn open_file_dialog(app: &mut JewelryCalculatorApp, ctx: &Context) {
 }
 
 /// Handle drag-and-drop files
-fn handle_dropped_files(app: &mut JewelryCalculatorApp, ctx: &Context) {
-    ctx.input(|i| {
+fn handle_dropped_files(app: &mut JewelryCalculatorApp, ui: &Ui) {
+    ui.input(|i| {
         for file in &i.raw.dropped_files {
-            if let Some(path) = &file.path {
-                let ext = path.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.to_lowercase());
-                
-                if matches!(ext.as_deref(), Some("stl") | Some("obj")) {
-                    app.load_mesh_file(path.clone());
-                }
+            let path = file.path();
+            let ext = path.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase());
+
+            if matches!(ext.as_deref(), Some("stl") | Some("obj")) {
+                app.load_mesh_file(path.to_path_buf());
             }
         }
     });
@@ -196,7 +195,7 @@ fn render_jewelry_type_section(app: &mut JewelryCalculatorApp, ui: &mut Ui) {
 }
 
 /// Ring sizing section with export buttons
-fn render_ring_section(app: &mut JewelryCalculatorApp, ui: &mut Ui, ctx: &Context) {
+fn render_ring_section(app: &mut JewelryCalculatorApp, ui: &mut Ui) {
     ui.heading("Ring Sizing");
 
     // Current diameter
@@ -314,13 +313,13 @@ fn render_ring_section(app: &mut JewelryCalculatorApp, ui: &mut Ui, ctx: &Contex
             // Single size export (use first/only size)
             let single_enabled = !app.exporting && sizes.len() == 1;
             if ui.add_enabled(single_enabled, egui::Button::new("Export Size")).clicked() {
-                export_single_ring(app, ctx, sizes[0]);
+                export_single_ring(app, ui.ctx(), sizes[0]);
             }
             
             // Export all button
             let batch_enabled = !app.exporting && sizes.len() > 1;
             if ui.add_enabled(batch_enabled, egui::Button::new(format!("Export All ({})", sizes.len()))).clicked() {
-                export_all_rings(app, ctx);
+                export_all_rings(app, ui.ctx());
             }
             
             if app.exporting {

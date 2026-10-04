@@ -5,7 +5,7 @@ pub mod center_panel;
 pub mod right_panel;
 pub mod gpu_mesh;
 
-use egui::{Context, SidePanel, CentralPanel, TopBottomPanel, Color32, RichText};
+use egui::{CentralPanel, Color32, Panel, RichText, Ui};
 
 use crate::app_state::JewelryCalculatorApp;
 
@@ -20,56 +20,55 @@ mod colors {
 }
 
 /// Render the complete UI
-pub fn render_ui(app: &mut JewelryCalculatorApp, ctx: &Context) {
-    // Process any pending async messages
-    app.process_async_messages();
-    app.clear_old_status();
+pub fn render_ui(app: &mut JewelryCalculatorApp, ui: &mut Ui) {
+    // Apply the global style to the root Ui.
+    ui.set_style(ui.ctx().global_style());
 
     // Ensure we repaint if the GPU renderer has pending data to upload
     if app
         .viewer_state
         .gpu_renderer
         .lock()
-        .map_or(false, |r| r.has_pending_upload())
+        .is_ok_and(|r| r.has_pending_upload())
     {
-        ctx.request_repaint();
+        ui.ctx().request_repaint();
     }
 
     // Top panel with status bar
-    render_top_panel(app, ctx);
+    render_top_panel(app, ui);
 
     // Bottom panel with log (collapsible)
     if app.panel_state.show_log_panel {
-        render_bottom_panel(ctx);
+        render_bottom_panel(ui);
     }
 
     // Left side panel with options
-    SidePanel::left("left_panel")
-        .default_width(280.0)
-        .min_width(250.0)
-        .max_width(400.0)
-        .show(ctx, |ui| {
-            left_panel::render(app, ui, ctx);
+    Panel::left("left_panel")
+        .default_size(280.0)
+        .min_size(250.0)
+        .max_size(400.0)
+        .show(ui, |ui| {
+            left_panel::render(app, ui);
         });
 
     // Right side panel with report
-    SidePanel::right("right_panel")
-        .default_width(350.0)
-        .min_width(300.0)
-        .max_width(500.0)
-        .show(ctx, |ui| {
-            right_panel::render(app, ui, ctx);
+    Panel::right("right_panel")
+        .default_size(350.0)
+        .min_size(300.0)
+        .max_size(500.0)
+        .show(ui, |ui| {
+            right_panel::render(app, ui);
         });
 
     // Central panel with 3D viewer
-    CentralPanel::default().show(ctx, |ui| {
-        center_panel::render(app, ui, ctx);
+    CentralPanel::default().show(ui, |ui| {
+        center_panel::render(app, ui);
     });
 }
 
 /// Render the top status bar
-fn render_top_panel(app: &mut JewelryCalculatorApp, ctx: &Context) {
-    TopBottomPanel::top("top_panel").show(ctx, |ui| {
+fn render_top_panel(app: &mut JewelryCalculatorApp, ui: &mut Ui) {
+    Panel::top("top_panel").show(ui, |ui| {
         ui.horizontal(|ui| {
             // App title
             ui.heading(RichText::new("Jewelry Cost Calculator").color(colors::NEON_CYAN));
@@ -130,14 +129,12 @@ fn render_top_panel(app: &mut JewelryCalculatorApp, ctx: &Context) {
 }
 
 /// Render the bottom log panel
-fn render_bottom_panel(ctx: &Context) {
-    TopBottomPanel::bottom("log_panel")
+fn render_bottom_panel(ui: &mut Ui) {
+    Panel::bottom("log_panel")
         .resizable(true)
-        .default_height(200.0)
-        .max_height(400.0)
-        .show(ctx, |ui| 
-            egui_logger::logger_ui().show(ui)
-        );
+        .default_size(200.0)
+        .max_size(400.0)
+        .show(ui, |ui| egui_logger::logger_ui().show(ui));
 }
 
 /// Format a number with appropriate precision
