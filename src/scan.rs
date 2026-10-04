@@ -3,6 +3,8 @@
 //! Invoked as a subcommand so the GUI binary doubles as a CLI:
 //!   jewelry_cost_calculator scan <DIR> [--kind ring|pendant|auto] [--recursive]
 //!   [--dry-run] [--offline] [--wax-cost 0.10] [--report out.json]
+//!   jewelry_cost_calculator resize <FILE> --size 10 [--from-diameter 17.862 | --from-size 8]
+//!   [--out PATH] [--format stl]
 //!
 //! Ring files are named with the size appended to the design (e.g. `Hades9.stl`,
 //! `Kamon-11.25.stl`, `AthenaRing8.obj`). The size becomes the row's ring_size and
@@ -18,8 +20,9 @@ use clap::{Args, Parser, Subcommand};
 use regex::Regex;
 use serde::Serialize;
 
+use crate::database::files::{generate_export_filename, ExportFormat};
 use crate::materials::calculate_all_weights;
-use crate::mesh::{load_mesh, volume::calculate_volume_cm3};
+use crate::mesh::{export::export_scaled_mesh, load_mesh, volume::calculate_volume_cm3};
 use crate::pricing::{api::fetch_metal_prices, calculate_all_costs, MetalPrices, WaxPricing};
 use crate::report::{CostReport, JewelryType};
 use crate::ring_sizing::{
@@ -45,6 +48,8 @@ enum Commands {
     Scan(ScanArgs),
     /// Detect the modeled US ring size from a mesh's inner-hole geometry
     Detect(DetectArgs),
+    /// Scale a ring mesh to a target US size and export it
+    Resize(ResizeArgs),
 }
 
 #[derive(Args)]
@@ -54,6 +59,27 @@ struct DetectArgs {
     /// Recurse into subdirectories when given a directory
     #[arg(long)]
     recursive: bool,
+}
+
+#[derive(Args)]
+struct ResizeArgs {
+    /// STL/OBJ file to resize
+    path: PathBuf,
+    /// Target US ring size (e.g. 10 or 8.5)
+    #[arg(long)]
+    size: f64,
+    /// Current US ring size, overriding geometry/filename detection
+    #[arg(long)]
+    from_size: Option<f64>,
+    /// Current inner bore diameter in mm, overriding --from-size and detection
+    #[arg(long)]
+    from_diameter: Option<f64>,
+    /// Output file path (default: alongside the input, named "<stem>-size<N>.<format>")
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Output format: stl or obj
+    #[arg(long, default_value = "stl")]
+    format: String,
 }
 
 #[derive(Args)]
@@ -91,13 +117,17 @@ struct ScanArgs {
 
 /// Handle the `scan` subcommand; returns Some(exit_code) when handled, None for GUI.
 pub async fn dispatch() -> Option<i32> {
-    if !matches!(std::env::args().nth(1).as_deref(), Some("scan") | Some("detect")) {
+    if !matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("scan") | Some("detect") | Some("resize")
+    ) {
         return None;
     }
     let cli = Cli::parse();
     match cli.command {
         Commands::Scan(args) => Some(run(args).await),
         Commands::Detect(args) => Some(run_detect(args)),
+        Commands::Resize(args) => Some(run_resize(args)),
     }
 }
 
@@ -160,6 +190,103 @@ fn run_detect(args: DetectArgs) -> i32 {
     } else {
         0
     }
+}
+
+/// Scale a ring mesh to a target US size and write the resulting STL/OBJ.
+fn run_resize(args: ResizeArgs) -> i32 {
+    let format = match ExportFormat::from_extension(&args.format) {
+        Some(f) => f,
+        None => {
+            eprintln!("resize failed: --format must be stl or obj (got '{}')", args.format);
+            return 1;
+        }
+    };
+
+    let mesh = match load_mesh(&args.path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("resize failed: load failed ({e})");
+            return 1;
+        }
+    };
+
+    let stem = args.path.file_stem().and_then(|s| s.to_str()).unwrap_or("mesh");
+
+    let current_diameter = if let Some(d) = args.from_diameter {
+        if !(d > 0.0) {
+            eprintln!("resize failed: --from-diameter must be positive");
+            return 1;
+        }
+        d
+    } else if let Some(from_size) = args.from_size {
+        RingSize(from_size).inner_diameter_mm()
+    } else if let Some(b) = measure_inner_diameter(&mesh).filter(|b| b.coverage >= 0.5) {
+        eprintln!(
+            "detected current size: {} (inner Ø {:.2} mm, coverage {:.0}%)",
+            RingSize::from_diameter_mm(b.diameter_mm).display(),
+            b.diameter_mm,
+            b.coverage * 100.0
+        );
+        b.diameter_mm
+    } else if let Some(h) = detect_ring_hole(&mesh) {
+        eprintln!(
+            "detected current size (ray-cast): {} (inner Ø {:.2} mm, confidence {:.0}%)",
+            RingSize::from_diameter_mm(h.diameter_mm).display(),
+            h.diameter_mm,
+            h.confidence * 100.0
+        );
+        h.diameter_mm
+    } else if let Some((_, size)) = parse_ring(stem) {
+        eprintln!("no measurable bore; trusting size from filename: US {}", fmt_size(size));
+        RingSize(size).inner_diameter_mm()
+    } else {
+        eprintln!(
+            "resize failed: could not detect the current ring size from geometry or filename; pass --from-size"
+        );
+        return 1;
+    };
+
+    let target_size = RingSize(args.size);
+    let scale_factor = calculate_scale_factor(current_diameter, target_size);
+
+    let data = match export_scaled_mesh(&mesh, scale_factor, format) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("resize failed: export failed ({e})");
+            return 1;
+        }
+    };
+
+    let out_path = args.out.clone().unwrap_or_else(|| {
+        let filename = generate_export_filename(
+            args.path.file_name().and_then(|n| n.to_str()).unwrap_or(stem),
+            target_size.0,
+            format,
+        );
+        args.path.with_file_name(filename)
+    });
+
+    if let Err(e) = std::fs::write(&out_path, &data) {
+        eprintln!("resize failed: write failed ({e})");
+        return 1;
+    }
+
+    let volume_cm3 = calculate_volume_cm3(&mesh);
+    let scaled_volume_cm3 = calculate_scaled_volume(volume_cm3, scale_factor);
+    println!(
+        "{} -> {} ({}), bore {:.3} -> {:.3} mm, scale {:.5}x, volume {:.3} cm3 -> {:.3} cm3, wrote {}",
+        args.path.display(),
+        target_size.display(),
+        format.extension(),
+        current_diameter,
+        target_size.inner_diameter_mm(),
+        scale_factor,
+        volume_cm3,
+        scaled_volume_cm3,
+        out_path.display()
+    );
+
+    0
 }
 
 async fn run(args: ScanArgs) -> i32 {
